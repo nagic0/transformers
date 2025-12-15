@@ -695,6 +695,59 @@ def _load_state_dict_into_meta_model(
     is_quantized = hf_quantizer is not None
     is_safetensors = shard_file.endswith(".safetensors")
     is_meta_state_dict = is_safetensors
+
+    usm_device = os.environ.get("USM_DEVICE", None)
+    if usm_device is not None:
+        # Only attempt the USM fast-path for safetensors meta-state-dicts and
+        # when no dtype casting or quantization will be required for any param.
+        use_usm = True
+        if not is_safetensors:
+            logger.warning("USM_DEVICE is set but the shard file is not a safetensors file. Ignoring USM_DEVICE.")
+            use_usm = False
+        else:
+            # Quick scan: if any parameter requires casting or quantization, we must
+            # fallback to the regular loading path which handles those transformations.
+            for param_name in list(state_dict.keys()):
+                empty_param = state_dict[param_name]
+                try:
+                    to_contiguous, casting_dtype = _infer_parameter_dtype(
+                        model, param_name, empty_param, keep_in_fp32_regex, hf_quantizer
+                    )
+                except Exception:
+                    use_usm = False
+                    logger.warning(
+                        "USM_DEVICE is set but failed to infer parameter dtype. "
+                        "Falling back to regular loading path."
+                    )
+                    break
+                if casting_dtype is not None and casting_dtype != empty_param.dtype:
+                    use_usm = False
+                    logger.warning(
+                        f"USM_DEVICE is set but at least one parameter requires dtype casting to {casting_dtype}. "
+                        "Falling back to regular loading path."
+                    )
+                    break
+                if hf_quantizer is not None and hf_quantizer.param_needs_quantization(model, param_name):
+                    use_usm = False
+                    logger.warning(
+                        "USM_DEVICE is set but at least one parameter requires quantization. "
+                        "Falling back to regular loading path."
+                    )
+                    break
+
+        if use_usm:
+            file_pointer = safe_open(shard_file, framework="pt", usm_device=usm_device)
+            params_to_load = list(state_dict.keys())
+            for param_name in params_to_load:
+                empty_param = state_dict[param_name]
+                if is_meta_state_dict:
+                    serialized_param_name = reverse_renaming_mapping[param_name]
+                    param = file_pointer.get_tensor(serialized_param_name)
+                    _load_parameter_into_model(model, param_name, param)
+            file_pointer.__exit__(None, None, None)
+            return None
+        # else: fall back to the regular (non-USM) loading path below
+
     file_pointer = safe_open(shard_file, framework="pt", device=tensor_device) if is_meta_state_dict else None
     params_to_load = list(state_dict.keys())
 
