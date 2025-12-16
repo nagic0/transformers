@@ -164,6 +164,7 @@ SpecificPreTrainedModelType = TypeVar("SpecificPreTrainedModelType", bound="PreT
 _init_weights = True
 _is_quantized = False
 _is_ds_init_called = False
+_usm_device = None
 
 
 def is_local_dist_rank_0():
@@ -260,6 +261,16 @@ def set_zero3_state():
         yield
     finally:
         _is_ds_init_called = False
+
+# Context manager to enable USM device for safetensors loading
+@contextmanager
+def set_usm_device(device: str):
+    global _usm_device
+    try:
+        _usm_device = device
+        yield
+    finally:
+        _usm_device = None
 
 
 def restore_default_dtype(func):
@@ -696,13 +707,12 @@ def _load_state_dict_into_meta_model(
     is_safetensors = shard_file.endswith(".safetensors")
     is_meta_state_dict = is_safetensors
 
-    usm_device = os.environ.get("USM_DEVICE", None)
-    if usm_device is not None:
+    if _usm_device is not None:
         # Only attempt the USM fast-path for safetensors meta-state-dicts and
         # when no dtype casting or quantization will be required for any param.
         use_usm = True
         if not is_safetensors:
-            logger.warning("USM_DEVICE is set but the shard file is not a safetensors file. Ignoring USM_DEVICE.")
+            logger.warning(f"USM device is set to {_usm_device} but the shard file is not a safetensors file. Ignoring USM device.")
             use_usm = False
         else:
             # Quick scan: if any parameter requires casting or quantization, we must
@@ -716,27 +726,27 @@ def _load_state_dict_into_meta_model(
                 except Exception:
                     use_usm = False
                     logger.warning(
-                        "USM_DEVICE is set but failed to infer parameter dtype. "
+                        f"USM device is set to {_usm_device} but failed to infer parameter dtype. "
                         "Falling back to regular loading path."
                     )
                     break
                 if casting_dtype is not None and casting_dtype != empty_param.dtype:
                     use_usm = False
                     logger.warning(
-                        f"USM_DEVICE is set but at least one parameter requires dtype casting to {casting_dtype}. "
+                        f"USM device is set to {_usm_device} but at least one parameter requires dtype casting to {casting_dtype}. "
                         "Falling back to regular loading path."
                     )
                     break
                 if hf_quantizer is not None and hf_quantizer.param_needs_quantization(model, param_name):
                     use_usm = False
                     logger.warning(
-                        "USM_DEVICE is set but at least one parameter requires quantization. "
+                        f"USM device is set to {_usm_device} but at least one parameter requires quantization. "
                         "Falling back to regular loading path."
                     )
                     break
 
         if use_usm:
-            file_pointer = safe_open(shard_file, framework="pt", usm_device=usm_device)
+            file_pointer = safe_open(shard_file, framework="pt", usm_device=_usm_device)
             params_to_load = list(state_dict.keys())
             for param_name in params_to_load:
                 empty_param = state_dict[param_name]
@@ -5480,7 +5490,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             verify_tp_plan(expected_keys, getattr(model, "_tp_plan", None))
 
         # Warmup cuda to load the weights much faster on devices
-        if device_map is not None and not is_hqq_or_quark:
+        if _usm_device is None and device_map is not None and not is_hqq_or_quark:
             expanded_device_map = expand_device_map(device_map, expected_keys)
             caching_allocator_warmup(model, expanded_device_map, hf_quantizer)
 
