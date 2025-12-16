@@ -6150,7 +6150,10 @@ def caching_allocator_warmup(model: PreTrainedModel, expanded_device_map: dict, 
         if device.type in ["cuda", "xpu"]:
             torch_accelerator_module = getattr(torch, device.type)
             index = device.index if device.index is not None else torch_accelerator_module.current_device()
-            device_memory = torch_accelerator_module.mem_get_info(index)[0]
+            try:
+                device_memory = torch_accelerator_module.mem_get_info(index)[0]
+            except:
+                device_memory = 0
             # Allow up to (max device memory - 1.2 GiB) in resource-constrained hardware configurations. Trying to reserve more
             # than that amount might sometimes lead to unnecessary cuda/xpu OOM, if the last parameter to be loaded on the device is large,
             # and the remaining reserved memory portion is smaller than the param size -> torch will then try to fully re-allocate all
